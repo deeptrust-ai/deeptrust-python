@@ -10,12 +10,19 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 import respx
 
 from deeptrust.agents import DeepTrust
 from deeptrust.agents.elevenlabs import Monitor, _read_turn, contextual_update_command
 from deeptrust.agents.livekit import attach
-from deeptrust.agents.vapi import Bridge, add_message_command
+from deeptrust.agents.vapi import (
+    SECRET_HEADER,
+    Bridge,
+    WebhookVerificationError,
+    _read_header,
+    add_message_command,
+)
 from deeptrust.agents.vapi import _read_turn as _vapi_read_turn
 
 BASE = "https://example.test/api/v1"
@@ -473,3 +480,68 @@ async def test_vapi_tool_calls_are_not_answered() -> None:
         assert await bridge.handle(event) is None
 
     assert analyze.call_count == 0
+
+
+# ── webhook verification ─────────────────────────────────────────────────────
+
+
+def _guarded_bridge(secret: str | None = "s3cret") -> Bridge:
+    return Bridge(
+        DeepTrust(api_key="dt_test", base_url=BASE),
+        api_key="vapi_test",
+        secret=secret,
+        deliver=False,
+    )
+
+
+@respx.mock
+async def test_vapi_refuses_a_request_without_the_secret() -> None:
+    analyze = respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    bridge = _guarded_bridge()
+
+    with pytest.raises(WebhookVerificationError):
+        await bridge.handle(_transcript_event("user", "reset my password"), headers={})
+
+    assert not analyze.called
+    assert bridge.session("call_1") is None
+
+
+@respx.mock
+async def test_vapi_refuses_a_wrong_secret() -> None:
+    bridge = _guarded_bridge()
+
+    with pytest.raises(WebhookVerificationError):
+        await bridge.handle(
+            _transcript_event("user", "reset my password"),
+            headers={SECRET_HEADER: "nope"},
+        )
+
+
+@respx.mock
+async def test_vapi_accepts_the_right_secret() -> None:
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    bridge = _guarded_bridge()
+
+    result = await bridge.handle(
+        _transcript_event("user", "reset my password"),
+        headers={"X-Vapi-Secret": "s3cret"},
+    )
+
+    assert result is not None
+
+
+async def test_vapi_without_a_secret_keeps_working() -> None:
+    assert _guarded_bridge(secret=None).verify(None) is True
+
+
+async def test_vapi_reads_the_header_case_insensitively() -> None:
+    bridge = _guarded_bridge()
+
+    assert bridge.verify({"X-Vapi-Secret": "s3cret"}) is True
+    assert bridge.verify({"x-vapi-secret": "s3cret"}) is True
+    assert bridge.verify({}) is False
+    assert _read_header(None, SECRET_HEADER) == ""

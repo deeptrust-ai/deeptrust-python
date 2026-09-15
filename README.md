@@ -163,15 +163,38 @@ here.
 
 ```python
 from deeptrust.agents import DeepTrust
-from deeptrust.agents.vapi import Bridge
+from deeptrust.agents.vapi import Bridge, WebhookVerificationError
 
-bridge = Bridge(DeepTrust(), api_key=os.environ["VAPI_API_KEY"])
+bridge = Bridge(
+    DeepTrust(),
+    api_key=os.environ["VAPI_API_KEY"],
+    secret=os.environ["VAPI_WEBHOOK_SECRET"],   # see below, do not skip it
+)
 
 @app.post("/vapi/webhook")            # your route, on your server
-async def vapi_webhook(payload: dict):
-    await bridge.handle(payload, user=caller)
+async def vapi_webhook(request: Request, payload: dict):
+    try:
+        await bridge.handle(payload, user=caller, headers=request.headers)
+    except WebhookVerificationError:
+        raise HTTPException(status_code=401)
     return {}
 ```
+
+### Verify the webhook
+
+Your route is a public URL. Anyone who learns it can post a transcript that was
+never said, and it becomes a real call, a real analysis and a real finding in
+your organization. A forged `end-of-call-report` can also end a real call's
+session early.
+
+Set `server.secret` on the assistant, which is the Authorization section of its
+Webhook Server settings. VAPI sends it back in `X-Vapi-Secret` on every request.
+Pass the same value as `secret`, hand `handle` the request headers, and a
+request without it is refused before a single turn is recorded. The compare uses
+`hmac.compare_digest`.
+
+The bridge does not require it, so an existing integration keeps working, but a
+bridge with no `secret` trusts whatever arrives.
 
 VAPI is the mirror image of ElevenLabs. Nobody can hold a socket: VAPI posts
 its server-url events to *your* server, so the adapter is a handler you call
