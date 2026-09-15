@@ -3,12 +3,26 @@
     from deeptrust.agents import DeepTrust
     from deeptrust.agents.vapi import Bridge
 
-    bridge = Bridge(DeepTrust(), api_key=os.environ["VAPI_API_KEY"])
+    bridge = Bridge(
+        DeepTrust(),
+        api_key=os.environ["VAPI_API_KEY"],
+        secret=os.environ["VAPI_WEBHOOK_SECRET"],   # do not skip it
+    )
 
     @app.post("/vapi/webhook")             # your route, your server
-    async def vapi_webhook(payload: dict):
-        await bridge.handle(payload, user=caller)
+    async def vapi_webhook(request: Request, payload: dict):
+        try:
+            await bridge.handle(payload, user=caller, headers=request.headers)
+        except WebhookVerificationError:
+            raise HTTPException(status_code=401)
         return {}
+
+Your route is a public URL, so verify what arrives. VAPI echoes the assistant's
+`server.secret` back in `X-Vapi-Secret` on every request; pass the headers and
+a request without it is refused before a turn is recorded. Without a `secret`
+the bridge trusts whatever arrives, which is enough for anyone who learns your
+URL to invent a call, or to end a real one early with a forged
+`end-of-call-report`.
 
 VAPI's transport is the mirror image of ElevenLabs'. There is no socket anyone
 can hold open: VAPI posts its server-url events to *your* server, and what goes
@@ -56,13 +70,14 @@ No extra dependency: httpx is already the client's own.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import hmac
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
 
-from ..errors import ConfigError
+from ..errors import ConfigError, DeepTrustError
 from ..types import Analysis, Nudge, User
 from . import DeepTrust
 from ._session import Session
@@ -71,6 +86,35 @@ API_BASE_URL = "https://api.vapi.ai"
 
 #: The only domain a control URL may point at.
 CONTROL_URL_DOMAIN = "vapi.ai"
+
+#: The header VAPI echoes ``server.secret`` back in.
+SECRET_HEADER = "x-vapi-secret"
+
+
+class WebhookVerificationError(DeepTrustError):
+    """The request did not carry the secret the bridge was configured with.
+
+    Raised by :meth:`Bridge.handle` before anything is recorded, so a forged
+    event cannot create a call, a turn or an analysis. Answer it with 401.
+    """
+
+
+def _read_header(headers: Mapping[str, str] | None, name: str) -> str:
+    """One header, case-insensitively, from whatever the framework hands over.
+
+    Starlette and aiohttp pass a case-insensitive mapping and a plain dict
+    works too, so the lookup cannot assume either.
+    """
+    if not headers:
+        return ""
+    direct = headers.get(name)
+    if direct is not None:
+        return str(direct)
+    lowered = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lowered:
+            return str(value)
+    return ""
 
 
 def add_message_command(text: str) -> dict[str, Any]:
@@ -100,12 +144,21 @@ class Bridge:
         dt: DeepTrust,
         *,
         api_key: str,
+        secret: str | None = None,
         deliver: bool = True,
         on_analysis: Callable[[Analysis], None] | None = None,
         base_url: str = API_BASE_URL,
     ) -> None:
         """`api_key` is a VAPI private key: it reads the call object to find
-        the control URL when an event does not carry one."""
+        the control URL when an event does not carry one.
+
+        `secret` is the assistant's `server.secret`, which VAPI echoes back in
+        `X-Vapi-Secret` on every request. Set it and pass the request headers
+        to `handle`, and a request without it is refused before anything is
+        recorded. Your route is a public URL: without this, anyone who learns
+        it can post a transcript that was never said and have it become a real
+        call, a real analysis and a real finding in your organization.
+        """
         if not api_key:
             raise ConfigError(
                 "Bridge needs a VAPI private API key. It reads the call to "
@@ -113,6 +166,7 @@ class Bridge:
             )
         self._dt = dt
         self._key = api_key
+        self._secret = secret
         self._deliver = deliver
         self._on_analysis = on_analysis
         self._base_url = base_url
@@ -126,6 +180,7 @@ class Bridge:
         payload: dict[str, Any],
         *,
         user: User | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> Analysis | None:
         """Process one server-url event. Returns the analysis it caused, if any.
 
@@ -134,7 +189,15 @@ class Bridge:
         call object the control URL is learned from.
 
         Returns None for an event that started no job, which is most of them.
+
+        Raises `WebhookVerificationError` when a secret is configured and the
+        request did not carry it.
         """
+        if not self.verify(headers):
+            raise WebhookVerificationError(
+                "the request did not carry the VAPI secret. Set server.secret "
+                "on the assistant and pass the request headers to handle."
+            )
         message = _message(payload)
         call = message.get("call")
         call = call if isinstance(call, dict) else {}
@@ -174,6 +237,18 @@ class Bridge:
             for nudge in result.nudges:
                 await self.send_nudge(call_id, nudge)
         return result
+
+    def verify(self, headers: Mapping[str, str] | None) -> bool:
+        """Whether a request carries the configured secret.
+
+        True when no secret is configured, so an existing integration keeps
+        working; the README says what that costs. Compared with
+        `hmac.compare_digest`, so a caller cannot learn the secret one
+        character at a time from how long the refusal took.
+        """
+        if not self._secret:
+            return True
+        return hmac.compare_digest(_read_header(headers, SECRET_HEADER), self._secret)
 
     async def send_nudge(self, call_id: str, nudge: Nudge) -> bool:
         """Send one nudge into a live call. Returns whether VAPI took it.
