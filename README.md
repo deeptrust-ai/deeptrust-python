@@ -156,6 +156,61 @@ await DeepTrust().watch(conversation_id)          # platform="elevenlabs"
 was already watching. It raises `ServiceError` with status 404 when the
 platform is not connected for your organisation.
 
+## VAPI
+
+No extra install: the adapter talks to VAPI over HTTP, and `httpx` is already
+here.
+
+```python
+from deeptrust.agents import DeepTrust
+from deeptrust.agents.vapi import Bridge
+
+bridge = Bridge(DeepTrust(), api_key=os.environ["VAPI_API_KEY"])
+
+@app.post("/vapi/webhook")            # your route, on your server
+async def vapi_webhook(payload: dict):
+    await bridge.handle(payload, user=caller)
+    return {}
+```
+
+VAPI is the mirror image of ElevenLabs. Nobody can hold a socket: VAPI posts
+its server-url events to *your* server, so the adapter is a handler you call
+from your own webhook route rather than a watcher with a loop of its own. Hand
+it every event and let it decide — the ones that are not turns cost nothing,
+and they carry the call object the control URL is learned from. One bridge
+serves every call your server receives.
+
+Nudges go back on the per-call HTTPS endpoint VAPI publishes as
+`monitor.controlUrl`, as an `add-message` with `triggerResponseEnabled: true`.
+That is an interrupt, so VAPI behaves like LiveKit rather than ElevenLabs: the
+agent responds to the nudge immediately, cutting into what it was saying. It is
+sent as a system message, not a `say`, so your agent's own persona carries it
+instead of speaking our words verbatim.
+
+The control URL comes off the webhook payload when the event carries it, and
+from `GET /call/{id}` when it does not — which is why the bridge wants a VAPI
+private key. Inbound calls are the case this exists for: nobody placed the
+call, so there was no creation-time response to capture a URL from. Once
+resolved it is remembered for the rest of the call. A call that has already
+hung up publishes no control URL, and a nudge from its last turn is dropped
+rather than raising inside your webhook route.
+
+A control URL is only used if it is HTTPS on `vapi.ai`. Your webhook route is
+reachable from the internet and a nudge names what was found in the call, so a
+forged `monitor.controlUrl` would otherwise be a way to make this SDK post that
+text to someone else's host. Anything off that domain is treated as no URL, and
+the bridge asks VAPI for the real one.
+
+Only final transcripts are read. VAPI emits a `transcript` event per partial
+while the sentence is still being recognised, and analysing those would
+re-analyse the same sentence several times over. `monitor.listenUrl` next door
+is raw PCM audio and is ignored. `end-of-call-report` ends the DeepTrust
+session.
+
+`tool-calls` is the one event whose response controls what the agent does next,
+and this adapter does not answer it. Blocking an action is `Session.check`,
+which is not implemented in this version.
+
 ## Your own stack
 
 Neither adapter is required. If your agent is somewhere else, the two verbs are

@@ -6,7 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "DeepTrust", email = "engineering@deeptrust.ai" }]
-keywords = ["voice", "agents", "livekit", "elevenlabs", "observability", "security"]
+keywords = [
+  "voice",
+  "agents",
+  "livekit",
+  "elevenlabs",
+  "vapi",
+  "observability",
+  "security",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -27,6 +35,8 @@ Issues = "https://github.com/deeptrust-ai/deeptrust-python/issues"
 # integrating their own stack should not be made to install a platform SDK.
 livekit = ["livekit-agents>=1.7"]
 elevenlabs = ["websockets>=13"]
+# No `vapi` extra: the adapter talks to VAPI over plain HTTP, and httpx is
+# already the core dependency.
 
 [build-system]
 requires = ["hatchling"]
