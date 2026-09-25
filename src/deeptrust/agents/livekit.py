@@ -223,6 +223,10 @@ def attach(
     delivery = _Delivery(agent_session, agent, interrupt)
     stop = delivery.listen(room, spawn) if room is not None else None
 
+    # Turns being sent right now, so the close can wait for them before it
+    # sends what is left and ends the call.
+    running: set[asyncio.Task[None]] = set()
+
     async def _run(role: str, text: str) -> None:
         call.append(role, text)
         if role != "user":
@@ -254,9 +258,20 @@ def attach(
             return
         last[role] = text
 
-        spawn(_run(role, text))
+        task = asyncio.create_task(_run(role, text))
+        running.add(task)
+        task.add_done_callback(running.discard)
 
     async def _end() -> None:
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        # Turns are sent when the caller speaks, so the agent's last reply
+        # after the caller's last line has not been sent yet. It is often the
+        # line that matters most ("I've reset your password"), so it goes up
+        # before the call is ended.
+        if call.pending:
+            with contextlib.suppress(DeepTrustError):
+                await call.analyze()
         # The server ends an idle call on its own a few minutes later, so a
         # failed end costs time, not the record.
         with contextlib.suppress(DeepTrustError):

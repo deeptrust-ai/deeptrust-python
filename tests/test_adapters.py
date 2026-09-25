@@ -409,6 +409,36 @@ async def test_livekit_close_ends_the_call_and_stops_listening() -> None:
 
 
 @respx.mock
+async def test_livekit_close_sends_the_agents_last_reply_before_ending() -> None:
+    """Found on a real phone call: the agent's "I've reset your password" came
+    after the caller's last line, so it was never sent and the record lost it."""
+    analyze = respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    end = respx.post(f"{BASE}/agents/sessions/sess_1/end").mock(
+        return_value=httpx.Response(200, json={"ended": True})
+    )
+    lk = FakeSession()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1")
+
+    await lk.say("user", "my manager approved it")
+    await settle()
+    await lk.say("assistant", "done, your password is reset")
+    await settle()
+    assert analyze.call_count == 1
+    lk.close()
+    await settle()
+
+    assert analyze.call_count == 2
+    last = json.loads(analyze.calls[-1].request.content)
+    assert last["turns"][-1]["text"] == "done, your password is reset"
+    assert end.call_count == 1
+    # Sent before the end, not after.
+    assert respx.calls[-1].request.url.path.endswith("/sessions/sess_1/end")
+
+
+@respx.mock
 async def test_livekit_close_survives_a_failed_end() -> None:
     respx.post(f"{BASE}/agents/analyze").mock(
         return_value=httpx.Response(200, json=ONE_NUDGE)
