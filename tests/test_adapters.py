@@ -6,7 +6,9 @@ turns only, and a nudge is delivered exactly once per finding that carries one.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -15,7 +17,7 @@ import respx
 
 from deeptrust.agents import DeepTrust
 from deeptrust.agents.elevenlabs import Monitor, _read_turn, contextual_update_command
-from deeptrust.agents.livekit import attach
+from deeptrust.agents.livekit import attach, listen
 from deeptrust.agents.vapi import (
     SECRET_HEADER,
     Bridge,
@@ -56,6 +58,7 @@ class FakeAgent:
 
     async def update_chat_ctx(self, chat: Any) -> None:
         self.updated.append(chat)
+        self.chat_ctx = chat
 
 
 class FakeChat:
@@ -71,32 +74,106 @@ class FakeChat:
         self.messages.append((role, content))
 
 
-class FakeSession:
-    """Stands in for a LiveKit AgentSession."""
+class FakeEmitter:
+    """Shaped like `livekit.rtc.EventEmitter`, which both `AgentSession` and
+    `rtc.Room` are: `on(event, callback)` registers, and `on(event)` alone
+    returns a decorator; `off(event, callback)` removes."""
 
     def __init__(self) -> None:
-        self.current_agent = FakeAgent()
-        self.handlers: dict[str, Any] = {}
-        self.interrupted = 0
-        self.replies: list[str] = []
+        self.handlers: dict[str, set[Any]] = {}
 
-    def on(self, event: str) -> Any:
+    def on(self, event: str, callback: Any = None) -> Any:
+        if callback is not None:
+            self.handlers.setdefault(event, set()).add(callback)
+            return callback
+
         def deco(fn: Any) -> Any:
-            self.handlers[event] = fn
+            self.handlers.setdefault(event, set()).add(fn)
             return fn
 
         return deco
 
+    def off(self, event: str, callback: Any) -> None:
+        self.handlers.get(event, set()).discard(callback)
+
+    def emit(self, event: str, arg: Any) -> None:
+        for fn in list(self.handlers.get(event, set())):
+            fn(arg)
+
+
+class FakeSession(FakeEmitter):
+    """Stands in for a LiveKit AgentSession."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.current_agent = FakeAgent()
+        self.interrupted = 0
+        # The keyword arguments of each generate_reply call.
+        self.replies: list[dict[str, Any]] = []
+
     def interrupt(self) -> None:
         self.interrupted += 1
 
-    def generate_reply(self, instructions: str) -> None:
-        self.replies.append(instructions)
+    def generate_reply(self, **kw: Any) -> None:
+        self.replies.append(kw)
 
     async def say(self, role: str, text: str) -> None:
         item = type("Item", (), {"text_content": text, "role": role})()
         ev = type("Ev", (), {"item": item})()
-        self.handlers["conversation_item_added"](ev)
+        self.emit("conversation_item_added", ev)
+
+    def close(self) -> None:
+        self.emit("close", type("CloseEvent", (), {"reason": "user_initiated"})())
+
+    @property
+    def system_messages(self) -> list[str]:
+        return [c for r, c in self.current_agent.chat_ctx.messages if r == "system"]
+
+
+@dataclass
+class FakePacket:
+    """Shaped like `livekit.rtc.DataPacket`. `participant` is None when the
+    packet was sent with the server API, which is how DeepTrust sends."""
+
+    data: bytes
+    kind: int = 1  # DataPacketKind.KIND_RELIABLE
+    participant: Any = None
+    topic: str | None = "deeptrust.nudge"
+
+
+class FakeRoom(FakeEmitter):
+    """Stands in for a `livekit.rtc.Room`."""
+
+    def push(self, packet: FakePacket) -> None:
+        self.emit("data_received", packet)
+
+
+NUDGE_ID = "3f2a9c0d1e4b5a67"
+NUDGE = ONE_NUDGE["findings"][0]["nudge"]
+NUDGE_TEXT = f"{NUDGE['description']} {NUDGE['details']}"
+
+
+def nudge_packet(**over: Any) -> FakePacket:
+    payload = {
+        "type": "deeptrust.nudge",
+        "id": NUDGE_ID,
+        "title": NUDGE["title"],
+        "description": NUDGE["description"],
+        "details": NUDGE["details"],
+        "text": NUDGE_TEXT,
+    }
+    return FakePacket(data=json.dumps(payload).encode(), **over)
+
+
+def with_id(response: dict[str, Any], nudge_id: str) -> dict[str, Any]:
+    finding = dict(response["findings"][0])
+    finding["nudge"] = {**finding["nudge"], "id": nudge_id}
+    return {**response, "findings": [finding]}
+
+
+async def settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0.01)
 
 
 @respx.mock
@@ -109,19 +186,52 @@ async def test_livekit_analyses_caller_turns_and_delivers_once() -> None:
     call = attach(lk, dt, external_id="room-1")
 
     await lk.say("user", "my colleague is telling me what to say")
-    # The handler spawns a task; let it run.
-    import asyncio
-
-    await asyncio.sleep(0)
-    await asyncio.sleep(0.05)
+    await settle()
 
     assert route.call_count == 1
     assert len(call.transcript) == 1
+    assert lk.system_messages == [NUDGE_TEXT]
     assert lk.interrupted == 1
-    assert len(lk.replies) == 1
-    assert "Ask one question" in lk.replies[0]
-    # The nudge went into the agent's context as well as being spoken.
-    assert lk.current_agent.updated
+    # The reply reads the nudge from the context. It is not repeated as
+    # instructions, which would put the same text in front of the model twice.
+    assert lk.replies == [{}]
+
+
+@respx.mock
+async def test_livekit_does_not_renudge_on_every_turn() -> None:
+    """The API reports a standing finding again on later jobs. The agent heard
+    it the first time."""
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    lk = FakeSession()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1")
+
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+    await lk.say("user", "can you hurry up please")
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT]
+    assert lk.interrupted == 1
+
+
+@respx.mock
+async def test_livekit_without_interrupt_only_adds_to_context() -> None:
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    lk = FakeSession()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1", interrupt=False)
+
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT]
+    assert lk.interrupted == 0
+    assert lk.replies == []
 
 
 @respx.mock
@@ -134,14 +244,188 @@ async def test_livekit_does_not_analyse_the_agents_own_turn() -> None:
     call = attach(lk, dt, external_id="room-1")
 
     await lk.say("assistant", "I need to confirm it is you first")
-    import asyncio
-
-    await asyncio.sleep(0.05)
+    await settle()
 
     assert route.call_count == 0
     # It is still in the transcript. It is just not a reason to run a job.
     assert len(call.transcript) == 1
     assert call.transcript.turns[0].role == "agent"
+
+
+@respx.mock
+async def test_livekit_pushed_nudge_is_injected_once() -> None:
+    lk, room = FakeSession(), FakeRoom()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1", room=room)
+
+    # Reliable delivery can still repeat a packet across a reconnect.
+    room.push(nudge_packet())
+    room.push(nudge_packet())
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT]
+    assert lk.interrupted == 1
+    assert lk.replies == [{}]
+
+
+@respx.mock
+async def test_livekit_analyze_response_with_a_pushed_id_is_ignored() -> None:
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=with_id(ONE_NUDGE, NUDGE_ID))
+    )
+    lk, room = FakeSession(), FakeRoom()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1", room=room)
+
+    room.push(nudge_packet())
+    await settle()
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT]
+    assert lk.interrupted == 1
+
+
+@respx.mock
+async def test_livekit_dedupes_by_text_when_the_response_has_no_id() -> None:
+    """An older API sends no id on the analyze response."""
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    lk, room = FakeSession(), FakeRoom()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1", room=room)
+
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+    room.push(nudge_packet())
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT]
+
+
+@respx.mock
+async def test_livekit_distinct_nudges_are_each_delivered() -> None:
+    lk, room = FakeSession(), FakeRoom()
+    listen(room, lk)
+
+    room.push(nudge_packet())
+    other = {
+        "type": "deeptrust.nudge",
+        "id": "0000000000000001",
+        "title": "Unverified",
+        "description": "The caller has not been verified.",
+        "details": None,
+        "text": "The caller has not been verified.",
+    }
+    room.push(FakePacket(data=json.dumps(other).encode()))
+    await settle()
+
+    assert lk.system_messages == [NUDGE_TEXT, "The caller has not been verified."]
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        pytest.param(nudge_packet(topic="ca"), id="other-topic"),
+        pytest.param(nudge_packet(topic=None), id="no-topic"),
+        pytest.param(FakePacket(data=b"not json"), id="not-json"),
+        pytest.param(FakePacket(data=b"\xff\xfe"), id="not-utf8"),
+        pytest.param(FakePacket(data=b"[1, 2]"), id="not-an-object"),
+        pytest.param(
+            FakePacket(data=json.dumps({"type": "other", "text": "x"}).encode()),
+            id="other-type",
+        ),
+        pytest.param(
+            FakePacket(data=json.dumps({"type": "deeptrust.nudge"}).encode()),
+            id="empty-nudge",
+        ),
+        # A participant, the caller included, can publish on any topic. Only the
+        # server API sends with no participant.
+        pytest.param(nudge_packet(participant=object()), id="from-a-participant"),
+    ],
+)
+async def test_livekit_ignores_packets_that_are_not_deeptrust_nudges(
+    packet: FakePacket,
+) -> None:
+    lk, room = FakeSession(), FakeRoom()
+    listen(room, lk)
+
+    room.push(packet)
+    await settle()
+
+    assert lk.system_messages == []
+    assert lk.interrupted == 0
+    assert lk.replies == []
+
+
+async def test_livekit_listen_never_touches_http() -> None:
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as mock:
+        lk, room = FakeSession(), FakeRoom()
+        listen(room, lk)
+
+        await lk.say("user", "my colleague is telling me what to say")
+        room.push(nudge_packet())
+        await settle()
+        lk.close()
+        await settle()
+
+        assert mock.calls.call_count == 0
+    assert lk.system_messages == [NUDGE_TEXT]
+
+
+async def test_livekit_listen_stops() -> None:
+    lk, room = FakeSession(), FakeRoom()
+    stop = listen(room, lk)
+    stop()
+    stop()
+
+    room.push(nudge_packet())
+    await settle()
+
+    assert lk.system_messages == []
+    assert not room.handlers["data_received"]
+
+
+@respx.mock
+async def test_livekit_close_ends_the_call_and_stops_listening() -> None:
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    end = respx.post(f"{BASE}/agents/sessions/sess_1/end").mock(
+        return_value=httpx.Response(200, json={"ended": True})
+    )
+    lk, room = FakeSession(), FakeRoom()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1", room=room)
+
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+    lk.close()
+    await settle()
+
+    assert end.call_count == 1
+    assert not room.handlers["data_received"]
+
+
+@respx.mock
+async def test_livekit_close_survives_a_failed_end() -> None:
+    respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(200, json=ONE_NUDGE)
+    )
+    end = respx.post(f"{BASE}/agents/sessions/sess_1/end").mock(
+        return_value=httpx.Response(500, json={"detail": "boom"})
+    )
+    lk = FakeSession()
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    attach(lk, dt, external_id="room-1")
+
+    await lk.say("user", "my colleague is telling me what to say")
+    await settle()
+    lk.close()
+    await settle()
+
+    assert end.call_count >= 1
 
 
 def test_elevenlabs_event_reader() -> None:

@@ -102,17 +102,49 @@ await call.analyze()  # None. nothing new was said
 pip install "deeptrust-ai[livekit]"
 ```
 
+There are two ways in, and both are one line in the worker.
+
+**The cloud way.** DeepTrust reads the call's transcript itself and pushes each
+nudge into the room, so the worker only has to listen and needs no DeepTrust
+key.
+
+1. Connect the LiveKit project in the DeepTrust dashboard (Settings, Voice
+   Agents).
+2. In LiveKit Cloud, add the webhook URL the dashboard gives you, so DeepTrust
+   hears when a room starts and ends.
+3. Add `listen` to the worker:
+
+```python
+from deeptrust.agents.livekit import listen
+
+listen(ctx.room, session, agent=agent)
+```
+
+`listen` never calls the DeepTrust API. It returns a function that stops
+listening, and stops on its own when the session closes.
+
+**The SDK way.** The worker sends the transcript from its own process:
+
 ```python
 from deeptrust.agents import DeepTrust, User
 from deeptrust.agents.livekit import attach
 
-attach(session, DeepTrust(), external_id=ctx.room.name, user=caller)
+attach(session, DeepTrust(), external_id=ctx.room.name, room=ctx.room, user=caller)
 ```
 
 That subscribes to the session's conversation items, runs a job when the caller
-says something new, and delivers the nudge. On LiveKit a nudge can interrupt: the
-analysis lands while the agent is still generating, so it can stop a sentence on
-its way out. Pass `interrupt=False` to shape the next turn instead.
+says something new, and delivers the nudge. With `room` it also delivers nudges
+DeepTrust pushes into the room. When the session closes it ends the DeepTrust
+call, so post-call processing starts at once.
+
+Either way a nudge reaches the agent once. The same nudge arriving on a push and
+on an analyze response, or reported again on a later turn, is delivered the
+first time only. It goes into the agent's chat context as a system message, so
+it shapes the rest of the call, not just the next reply.
+
+On LiveKit a nudge can interrupt: it lands while the agent is still generating,
+so it can stop a sentence on its way out. Pass `interrupt=False` to shape the
+next turn instead.
 
 ## ElevenLabs
 
@@ -292,8 +324,9 @@ Point a client at it with `DEEPTRUST_BASE_URL`.
 
 ## Status
 
-`0.0.1`, the first release. `analyze`, `end`, `watch` and both adapters work
-against the hosted API. `check` is defined and raises `NotImplementedError`.
+`0.0.2`. `analyze`, `end`, `watch` and the adapters work against the hosted
+API. On LiveKit, `listen` receives nudges DeepTrust pushes into the room, and
+`attach` delivers each nudge once instead of on every turn. `check` is defined and raises `NotImplementedError`.
 The shapes in `deeptrust.types` are the part most likely to move.
 
 The key travels in `X-DeepTrust-Api-Key`; the bearer form is still sent and
