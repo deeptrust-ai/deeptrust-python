@@ -105,11 +105,17 @@ class User:
 
 @dataclass(frozen=True)
 class Nudge:
-    """Something to tell the agent mid-call, with the action to take."""
+    """Something to tell the agent mid-call, with the action to take.
+
+    `id` identifies the nudge across the ways it can reach an agent: the same
+    nudge carries the same id on an analyze response and when DeepTrust pushes
+    it into a call. Older API versions do not send one, so it may be None.
+    """
 
     title: str
     description: str
     details: str
+    id: str | None = None
 
     def render(self) -> str:
         """`description` and `details` joined, for platforms that accept a

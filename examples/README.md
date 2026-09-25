@@ -5,7 +5,7 @@ README showing real output from a real run.
 
 | | |
 |---|---|
-| [`livekit/`](livekit) | An agent with DeepTrust attached in one line. Nudges can interrupt a reply in progress. |
+| [`livekit/`](livekit) | An agent with DeepTrust attached in one line, the SDK way or the cloud way. Nudges can interrupt a reply in progress. |
 | [`elevenlabs/`](elevenlabs) | An agent it provisions for you, watched from outside. No code inside the agent at all. |
 | [`elevenlabs-webhook/`](elevenlabs-webhook) | The call-start webhook you already own, turned into a watched call. Your process holds the socket. |
 

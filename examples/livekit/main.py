@@ -1,8 +1,13 @@
 """A LiveKit agent with DeepTrust attached.
 
+This is the SDK way: the worker sends the transcript from its own process.
+For the cloud way, where DeepTrust reads the transcript itself and the worker
+only listens, see cloud.py.
+
 Everything below the `attach` call is an ordinary LiveKit agent. `attach` is the
 only DeepTrust-specific line, and it wires both directions: caller turns go out
-for analysis, and any nudge that comes back is delivered to the agent.
+for analysis, and any nudge that comes back, or that DeepTrust pushes into the
+room, is delivered to the agent once.
 
 The rest of this file is what the demo UI in ../demo-ui needs to watch the
 call: every turn and every finding is published on the room's data channel
@@ -214,7 +219,10 @@ async def entrypoint(ctx: JobContext) -> None:
             # handed, and it reads them after this callback returns. Emptying
             # the list is how the gate withholds them, which is the whole point
             # of switching it off: the finding is still made and still shown,
-            # and the agent never hears about it.
+            # and the agent never hears about it. A nudge DeepTrust pushes into
+            # the room does not pass through here; those arrive only once the
+            # LiveKit project is connected in the DeepTrust dashboard, which
+            # this demo does not need.
             result.findings.clear()
 
     # The one DeepTrust line. Returns the session, so the transcript and the
@@ -223,6 +231,9 @@ async def entrypoint(ctx: JobContext) -> None:
         session,
         DeepTrust(),
         external_id=ctx.room.name,
+        # Also delivers nudges pushed into the room. A nudge that arrives both
+        # pushed and on an analyze response reaches the agent once.
+        room=ctx.room,
         agent=agent,
         user=User(
             id=profile["username"],

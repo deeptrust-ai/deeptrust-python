@@ -1,6 +1,6 @@
 [project]
 name = "deeptrust-ai"
-version = "0.0.1"
+version = "0.0.2"
 description = "QA and runtime nudges for voice agents, while the call is still happening."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,28 +1,45 @@
 # LiveKit
 
-An IT service desk agent on LiveKit with DeepTrust attached. One line of
-DeepTrust code, and everything else is an ordinary agent.
+An IT service desk agent on LiveKit with DeepTrust attached. There are two
+workers here, one per way in, and each has one line of DeepTrust code.
+
+**The SDK way, `main.py`.** The worker sends the transcript from its own
+process:
 
 ```python
 attach(
     session,
     DeepTrust(),
     external_id=ctx.room.name,
+    room=ctx.room,
     agent=agent,
     user=User(id=participant.identity, role="MEMBER"),
 )
 ```
 
 That wires both directions. Caller turns go out for analysis, and any nudge
-that comes back is added to the agent's context and interrupts the reply in
-progress.
+that comes back, or that DeepTrust pushes into the room, is added to the
+agent's context once and interrupts the reply in progress. When the session
+closes, the DeepTrust call is ended.
+
+**The cloud way, `cloud.py`.** DeepTrust reads the transcript itself and
+pushes nudges into the room, so the worker only listens and needs no DeepTrust
+key:
+
+```python
+listen(ctx.room, session, agent=agent)
+```
+
+For that, connect the LiveKit project in the DeepTrust dashboard (Settings,
+Voice Agents) and add the webhook shown there in LiveKit Cloud first.
 
 ## Run it
 
 ```bash
 cp .env.example .env    # fill in the keys
 uv sync
-uv run python main.py dev
+uv run python main.py dev     # the SDK way
+uv run python cloud.py dev    # or the cloud way
 ```
 
 Then talk to it from the [LiveKit agents

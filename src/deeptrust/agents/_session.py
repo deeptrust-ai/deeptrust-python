@@ -32,6 +32,7 @@ def _nudge(d: dict[str, Any] | None) -> Nudge | None:
         title=str(d.get("title") or ""),
         description=str(d.get("description") or ""),
         details=str(d.get("details") or ""),
+        id=str(d["id"]) if d.get("id") else None,
     )
 
 
