@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -17,7 +18,7 @@ import respx
 
 from deeptrust.agents import DeepTrust
 from deeptrust.agents.elevenlabs import Monitor, _read_turn, contextual_update_command
-from deeptrust.agents.livekit import attach, listen
+from deeptrust.agents.livekit import attach, listen, tag_call
 from deeptrust.agents.vapi import (
     SECRET_HEADER,
     Bridge,
@@ -174,6 +175,40 @@ def with_id(response: dict[str, Any], nudge_id: str) -> dict[str, Any]:
 async def settle() -> None:
     for _ in range(5):
         await asyncio.sleep(0.01)
+
+
+async def test_livekit_tag_call_sets_deeptrust_attributes() -> None:
+    room = FakeRoom()
+    set_to: dict[str, str] = {}
+
+    async def set_attributes(attributes: dict[str, str]) -> None:
+        set_to.update(attributes)
+
+    room.local_participant = SimpleNamespace(set_attributes=set_attributes)
+    await tag_call(
+        room, test_name="gpt-4o-vs-gpt-4.1", llm="openai/gpt-4.1", stt=None, tts=""
+    )
+
+    assert set_to == {
+        "deeptrust_test_name": "gpt-4o-vs-gpt-4.1",
+        "deeptrust_llm": "openai/gpt-4.1",
+    }
+
+
+def test_livekit_config_over_the_api_limits_fails_up_front() -> None:
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    with pytest.raises(ValueError):
+        attach(FakeSession(), dt, external_id="r", config={"llm": "x" * 1025})
+    with pytest.raises(ValueError):
+        attach(FakeSession(), dt, external_id="r", config={"prompt": "x" * 65537})
+    attach(FakeSession(), dt, external_id="r", config={"prompt": "x" * 5000})
+
+
+def test_livekit_attach_records_the_config_as_metadata() -> None:
+    dt = DeepTrust(api_key="dt_test", base_url=BASE)
+    call = attach(FakeSession(), dt, external_id="room-1", config={"test_name": "t1"})
+
+    assert call.metadata == {"deeptrust_test_name": "t1"}
 
 
 @respx.mock

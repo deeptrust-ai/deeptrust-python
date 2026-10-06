@@ -190,6 +190,30 @@ def listen(
     return stop
 
 
+# The API's metadata limits, checked here so a bad config fails once, not every request.
+MAX_CONFIG_KEYS = 32
+MAX_CONFIG_VALUE = 1024
+MAX_PROMPT = 65536
+
+
+def _config_attributes(config: dict[str, str | None]) -> dict[str, str]:
+    attributes = {f"deeptrust_{k}": str(v) for k, v in config.items() if v}
+    if len(attributes) > MAX_CONFIG_KEYS:
+        raise ValueError(f"config has more than {MAX_CONFIG_KEYS} keys")
+    for key, value in attributes.items():
+        limit = MAX_PROMPT if key == "deeptrust_prompt" else MAX_CONFIG_VALUE
+        if len(value) > limit:
+            raise ValueError(f"config {key} is longer than {limit} characters")
+    return attributes
+
+
+async def tag_call(room: Any, **config: str | None) -> None:
+    """Tag the call with what it ran on (test_name, prompt_id, llm, ...). Call after
+    ``ctx.connect()``; every participant sees it, so send ``prompt_id``, not
+    ``prompt``, with browser callers."""
+    await room.local_participant.set_attributes(_config_attributes(config))
+
+
 def attach(
     agent_session: Any,
     dt: DeepTrust,
@@ -200,6 +224,7 @@ def attach(
     user: User | None = None,
     interrupt: bool = True,
     on_analysis: Callable[[Any], None] | None = None,
+    config: dict[str, str | None] | None = None,
 ) -> Any:
     """Wire a LiveKit AgentSession to DeepTrust. Returns the DeepTrust session.
 
@@ -215,10 +240,17 @@ def attach(
     When the session closes, the DeepTrust call is ended so post-call
     processing starts at once.
 
+    Pass ``config`` to record what the call ran on (see ``tag_call``).
+
     Returns the DeepTrust session, so the transcript and findings remain
     reachable.
     """
-    call = dt.session(external_id=external_id, user=user, platform="livekit")
+    call = dt.session(
+        external_id=external_id,
+        user=user,
+        platform="livekit",
+        metadata=dict(_config_attributes(config or {})),
+    )
     spawn = _spawner()
     delivery = _Delivery(agent_session, agent, interrupt)
     stop = delivery.listen(room, spawn) if room is not None else None
