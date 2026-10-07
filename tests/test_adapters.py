@@ -204,11 +204,22 @@ def test_livekit_config_over_the_api_limits_fails_up_front() -> None:
     attach(FakeSession(), dt, external_id="r", config={"prompt": "x" * 5000})
 
 
-def test_livekit_attach_records_the_config_as_metadata() -> None:
+@respx.mock
+async def test_livekit_attach_sends_the_config_as_metadata() -> None:
+    route = respx.post(f"{BASE}/agents/analyze").mock(
+        return_value=httpx.Response(
+            200, json={"session_id": "sess_1", "job_id": "job_1", "findings": []}
+        )
+    )
+    lk = FakeSession()
     dt = DeepTrust(api_key="dt_test", base_url=BASE)
-    call = attach(FakeSession(), dt, external_id="room-1", config={"test_name": "t1"})
+    attach(lk, dt, external_id="room-1", config={"test_name": "t1", "llm": None})
 
-    assert call.metadata == {"deeptrust_test_name": "t1"}
+    await lk.say("user", "hello")
+    await settle()
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["metadata"] == {"deeptrust_test_name": "t1"}
 
 
 @respx.mock
